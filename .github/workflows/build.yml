@@ -5,7 +5,7 @@ on:
     branches: [ "main", "master" ]
   pull_request:
     branches: [ "main", "master" ]
-  workflow_dispatch: # Allows manual trigger from the Actions tab
+  workflow_dispatch:
 
 jobs:
   build:
@@ -26,6 +26,15 @@ jobs:
         run: |
           vcpkg integrate install
 
+      - name: Patch RC files (Replace afxres.h with winres.h)
+        shell: pwsh
+        run: |
+          # Replaces MFC's afxres.h with Windows SDK's winres.h in all .rc files
+          Get-ChildItem -Path . -Filter "*.rc" -Recurse | ForEach-Object {
+            Write-Host "Patching afxres.h in $($_.FullName)..."
+            (Get-Content $_.FullName) -replace 'afxres\.h', 'winres.h' | Set-Content $_.FullName
+          }
+
       - name: Build DisciplesGL
         shell: cmd
         run: |
@@ -38,16 +47,19 @@ jobs:
       - name: Prepare build artifact
         shell: pwsh
         run: |
-          # Create an output directory
           New-Item -ItemType Directory -Force -Path dist_package
 
-          # Copy dist files (runtime configs, assets, mods) if present
+          # Copy runtime assets and config from dist/ if present
           if (Test-Path "dist") {
             Copy-Item -Path "dist\*" -Destination "dist_package" -Recurse -Force
           }
 
-          # Locate and copy the compiled C4dll-R.dll
+          # Look for compiled DLL in workspace first, then whole D:\ drive (in case OutDir targeted D:\Games\...)
           $dll = Get-ChildItem -Path . -Filter "C4dll-R.dll" -Recurse | Select-Object -First 1
+          if (-not $dll) {
+            $dll = Get-ChildItem -Path "D:\" -Filter "C4dll-R.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+
           if ($dll) {
             Write-Host "Found compiled DLL at $($dll.FullName)"
             Copy-Item -Path $dll.FullName -Destination "dist_package\C4dll-R.dll" -Force
