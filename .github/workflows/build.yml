@@ -1,0 +1,63 @@
+name: Build DisciplesGL-Modern
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # Allows manual trigger from the Actions tab
+
+jobs:
+  build:
+    name: Build C4dll-R.dll (Win32 Release)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Integrate vcpkg
+        shell: cmd
+        run: |
+          vcpkg integrate install
+
+      - name: Build DisciplesGL
+        shell: cmd
+        run: |
+          msbuild src\DisciplesGL\DisciplesGL.vcxproj ^
+            /p:Configuration=Release ^
+            /p:Platform=Win32 ^
+            /p:VcpkgEnableManifest=true ^
+            /m
+
+      - name: Prepare build artifact
+        shell: pwsh
+        run: |
+          # Create an output directory
+          New-Item -ItemType Directory -Force -Path dist_package
+
+          # Copy dist files (runtime configs, assets, mods) if present
+          if (Test-Path "dist") {
+            Copy-Item -Path "dist\*" -Destination "dist_package" -Recurse -Force
+          }
+
+          # Locate and copy the compiled C4dll-R.dll
+          $dll = Get-ChildItem -Path . -Filter "C4dll-R.dll" -Recurse | Select-Object -First 1
+          if ($dll) {
+            Write-Host "Found compiled DLL at $($dll.FullName)"
+            Copy-Item -Path $dll.FullName -Destination "dist_package\C4dll-R.dll" -Force
+          } else {
+            Write-Error "C4dll-R.dll was not found after compilation!"
+            exit 1
+          }
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DisciplesGL-Modern-Release
+          path: dist_package/
