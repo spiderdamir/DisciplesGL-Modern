@@ -1,4 +1,4 @@
-name: Build Upstream Release
+name: Auto-Sync & Build Upstream Release
 
 on:
   workflow_dispatch:
@@ -8,89 +8,102 @@ on:
         required: true
         default: "latest"
         type: string
+      sync_fork:
+        description: "Sync fork branch with upstream before checking"
+        required: true
+        default: true
+        type: boolean
   schedule:
-    # Optional: check once a day at 06:00 UTC for a new upstream release
-    - cron: "0 6 * * *"
+    # Check every 6 hours (at 00:00, 06:00, 12:00, 18:00 UTC)
+    - cron: "0 */6 * * *"
 
 permissions:
-  contents: write # Required to push tags and create Releases on your fork
+  contents: write
 
 jobs:
+  check-and-sync:
+    name: Sync Fork & Check Upstream Release
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.upstream.outputs.should_build }}
+      tag: ${{ steps.upstream.outputs.tag }}
+      title: ${{ steps.upstream.outputs.title }}
+
+    steps:
+      - name: Auto-sync fork default branch with upstream
+        if: github.event_name == 'schedule' || inputs.sync_fork == true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Syncing ${{ github.repository }} (${{ github.event.repository.default_branch }}) with upstream..."
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/merge-upstream" \
+            -f branch="${{ github.event.repository.default_branch }}" \
+            || echo "Sync skipped (already synced, conflict, or not a fork)."
+
+      - name: Check latest upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INPUT_TAG="${{ inputs.release_tag }}"
+          if [ -z "$INPUT_TAG" ] || [ "$INPUT_TAG" = "latest" ]; then
+            RELEASE_JSON=$(gh api "repos/gitTerebi/DisciplesGL-Modern/releases/latest")
+          else
+            RELEASE_JSON=$(gh api "repos/gitTerebi/DisciplesGL-Modern/releases/tags/$INPUT_TAG")
+          fi
+
+          TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          TITLE=$(echo "$RELEASE_JSON" | jq -r 'if (.name // "") == "" then .tag_name else .name end')
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: $TAG ($TITLE)"
+
+          if gh api "repos/${{ github.repository }}/releases/tags/$TAG" >/dev/null 2>&1; then
+            EXISTS="true"
+          else
+            EXISTS="false"
+          fi
+
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$EXISTS" = "true" ]; then
+            echo "Release $TAG already exists on ${{ github.repository }}. Skipping Windows build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New release or manual trigger detected. Triggering build for $TAG."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-release:
-    name: Build Upstream Release (Win32)
+    name: Build Release (${{ needs.check-and-sync.outputs.tag }})
+    needs: check-and-sync
+    if: needs.check-and-sync.outputs.should_build == 'true'
     runs-on: windows-latest
 
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
 
-      - name: Query upstream release
-        id: upstream
-        shell: pwsh
-        run: |
-          $headers = @{
-            "Accept"        = "application/vnd.github+json"
-            "Authorization" = "Bearer ${{ secrets.GITHUB_TOKEN }}"
-          }
-
-          $inputTag = "${{ inputs.release_tag }}".Trim()
-          if ([string]::IsNullOrWhiteSpace($inputTag) -or $inputTag -eq "latest") {
-            $url = "https://api.github.com/repos/gitTerebi/DisciplesGL-Modern/releases/latest"
-          } else {
-            $url = "https://api.github.com/repos/gitTerebi/DisciplesGL-Modern/releases/tags/$inputTag"
-          }
-
-          $release = Invoke-RestMethod -Uri $url -Headers $headers
-          $tag = $release.tag_name
-          $title = if ([string]::IsNullOrWhiteSpace($release.name)) { $tag } else { $release.name }
-
-          Write-Host "Upstream release found: $tag ($title)"
-          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "title=$title" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-          # Save upstream release notes outside the git folder
-          $notes = "Compiled from upstream release ``$tag`` of gitTerebi/DisciplesGL-Modern.`n`n" + $release.body
-          $notes | Set-Content -Path "$env:RUNNER_TEMP\upstream_notes.md" -Encoding UTF8
-
-          # If triggered by schedule, skip if this release already exists on your fork
-          $forkUrl = "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag"
-          $exists = $false
-          try {
-            Invoke-RestMethod -Uri $forkUrl -Headers $headers | Out-Null
-            $exists = $true
-          } catch {
-            $exists = $false
-          }
-
-          if ("${{ github.event_name }}" -eq "schedule" -and $exists) {
-            Write-Host "Release $tag already exists on ${{ github.repository }}. Skipping scheduled build."
-            "should_build=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          } else {
-            "should_build=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          }
-
       - name: Fetch and checkout upstream release tag
-        if: steps.upstream.outputs.should_build == 'true'
         shell: cmd
         env:
-          TAG: ${{ steps.upstream.outputs.tag }}
+          TAG: ${{ needs.check-and-sync.outputs.tag }}
         run: |
           git fetch https://github.com/gitTerebi/DisciplesGL-Modern.git "refs/tags/%TAG%:refs/tags/%TAG%" --force
           git checkout -f "%TAG%"
           git submodule update --init --recursive
 
       - name: Set up MSBuild
-        if: steps.upstream.outputs.should_build == 'true'
         uses: microsoft/setup-msbuild@v2
 
       - name: Integrate vcpkg
-        if: steps.upstream.outputs.should_build == 'true'
         shell: cmd
         run: |
           vcpkg integrate install
 
       - name: Patch RC files if needed (afxres.h -> winres.h)
-        if: steps.upstream.outputs.should_build == 'true'
         shell: pwsh
         run: |
           Get-ChildItem -Path . -Filter "*.rc" -Recurse | ForEach-Object {
@@ -104,7 +117,6 @@ jobs:
           }
 
       - name: Build DisciplesGL
-        if: steps.upstream.outputs.should_build == 'true'
         shell: cmd
         run: |
           mkdir build_out
@@ -116,10 +128,9 @@ jobs:
             /m
 
       - name: Package Release Zip
-        if: steps.upstream.outputs.should_build == 'true'
         shell: pwsh
         env:
-          TAG: ${{ steps.upstream.outputs.tag }}
+          TAG: ${{ needs.check-and-sync.outputs.tag }}
         run: |
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\dist_package"
 
@@ -137,26 +148,33 @@ jobs:
           $zipPath = "$env:RUNNER_TEMP\DisciplesGL-Modern-$env:TAG-Win32.zip"
           Compress-Archive -Path "$env:RUNNER_TEMP\dist_package\*" -DestinationPath $zipPath -Force
 
+      - name: Fetch upstream release notes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-and-sync.outputs.tag }}
+        run: |
+          $release = gh api "repos/gitTerebi/DisciplesGL-Modern/releases/tags/$env:TAG" | ConvertFrom-Json
+          $notes = "Compiled from upstream release ``$env:TAG`` of gitTerebi/DisciplesGL-Modern.`n`n" + $release.body
+          $notes | Set-Content -Path "$env:RUNNER_TEMP\upstream_notes.md" -Encoding UTF8
+
       - name: Upload Build Artifact
-        if: steps.upstream.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: DisciplesGL-Modern-${{ steps.upstream.outputs.tag }}-Win32
-          path: ${{ runner.temp }}/DisciplesGL-Modern-${{ steps.upstream.outputs.tag }}-Win32.zip
+          name: DisciplesGL-Modern-${{ needs.check-and-sync.outputs.tag }}-Win32
+          path: ${{ runner.temp }}/DisciplesGL-Modern-${{ needs.check-and-sync.outputs.tag }}-Win32.zip
 
-      - name: Push tag and publish Release on fork
-        if: steps.upstream.outputs.should_build == 'true'
+      - name: Push tag to fork
         shell: cmd
         env:
-          TAG: ${{ steps.upstream.outputs.tag }}
+          TAG: ${{ needs.check-and-sync.outputs.tag }}
         run: |
           git push origin "refs/tags/%TAG%"
 
-      - name: Create GitHub Release
-        if: steps.upstream.outputs.should_build == 'true'
+      - name: Create GitHub Release on fork
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.upstream.outputs.tag }}
-          name: ${{ steps.upstream.outputs.title }}
+          tag_name: ${{ needs.check-and-sync.outputs.tag }}
+          name: ${{ needs.check-and-sync.outputs.title }}
           body_path: ${{ runner.temp }}/upstream_notes.md
-          files: ${{ runner.temp }}/DisciplesGL-Modern-${{ steps.upstream.outputs.tag }}-Win32.zip
+          files: ${{ runner.temp }}/DisciplesGL-Modern-${{ needs.check-and-sync.outputs.tag }}-Win32.zip
