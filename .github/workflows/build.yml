@@ -1,11 +1,21 @@
-name: Build DisciplesGL-Modern
+name: Build & Release DisciplesGL-Modern
 
 on:
   push:
     branches: [ "main", "master" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Publish a GitHub Release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write # Needed to create GitHub Releases
 
 jobs:
   build:
@@ -26,50 +36,63 @@ jobs:
         run: |
           vcpkg integrate install
 
-      - name: Patch RC files (Replace afxres.h with winres.h)
+      - name: Patch RC files if needed (afxres.h -> winres.h)
         shell: pwsh
         run: |
-          # Replaces MFC's afxres.h with Windows SDK's winres.h in all .rc files
           Get-ChildItem -Path . -Filter "*.rc" -Recurse | ForEach-Object {
-            Write-Host "Patching afxres.h in $($_.FullName)..."
-            (Get-Content $_.FullName) -replace 'afxres\.h', 'winres.h' | Set-Content $_.FullName
+            $content = Get-Content $_.FullName -Raw
+            if ($content -match 'afxres\.h') {
+              Write-Host "Patching afxres.h -> winres.h in $($_.FullName)"
+              ($content -replace 'afxres\.h', 'winres.h') | Set-Content $_.FullName -NoNewline
+            } else {
+              Write-Host "No afxres.h found in $($_.FullName), skipping."
+            }
           }
 
       - name: Build DisciplesGL
         shell: cmd
         run: |
+          mkdir build_out
           msbuild src\DisciplesGL\DisciplesGL.vcxproj ^
             /p:Configuration=Release ^
             /p:Platform=Win32 ^
             /p:VcpkgEnableManifest=true ^
+            /p:OutDir="%CD%\build_out\\" ^
             /m
 
-      - name: Prepare build artifact
+      - name: Package Release Zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist_package
 
-          # Copy runtime assets and config from dist/ if present
+          # 1. Copy ready-to-use files from dist/ (shaders, Imgs, Mods, etc.)
           if (Test-Path "dist") {
             Copy-Item -Path "dist\*" -Destination "dist_package" -Recurse -Force
           }
 
-          # Look for compiled DLL in workspace first, then whole D:\ drive (in case OutDir targeted D:\Games\...)
-          $dll = Get-ChildItem -Path . -Filter "C4dll-R.dll" -Recurse | Select-Object -First 1
-          if (-not $dll) {
-            $dll = Get-ChildItem -Path "D:\" -Filter "C4dll-R.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          }
-
-          if ($dll) {
-            Write-Host "Found compiled DLL at $($dll.FullName)"
-            Copy-Item -Path $dll.FullName -Destination "dist_package\C4dll-R.dll" -Force
-          } else {
-            Write-Error "C4dll-R.dll was not found after compilation!"
+          # 2. Verify C4dll-R.dll was compiled
+          if (-not (Test-Path "build_out\C4dll-R.dll")) {
+            Write-Error "C4dll-R.dll was not found in build_out\!"
             exit 1
           }
 
-      - name: Upload Artifact
+          # 3. Copy C4dll-R.dll (and any runtime DLLs placed in OutDir by vcpkg)
+          Copy-Item -Path "build_out\*.dll" -Destination "dist_package\" -Force
+
+          # 4. Compress into a single ready-to-install zip
+          Compress-Archive -Path "dist_package\*" -DestinationPath "DisciplesGL-Modern-Win32.zip" -Force
+
+      - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DisciplesGL-Modern-Release
-          path: dist_package/
+          name: DisciplesGL-Modern-Win32
+          path: DisciplesGL-Modern-Win32.zip
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.create_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.run_number) }}
+          name: DisciplesGL-Modern (${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.run_number) }})
+          files: DisciplesGL-Modern-Win32.zip
+          generate_release_notes: true
