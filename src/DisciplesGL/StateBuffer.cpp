@@ -49,14 +49,13 @@ StateBuffer::StateBuffer(VOID* data)
 StateBuffer::~StateBuffer()
 {
 	if (this->isAllocated)
-	{
 		MemoryFree(this->data);
-	}
 }
 
 StateBufferAligned::StateBufferAligned()
 {
 	this->size = { 0, 0 };
+	this->twinFrame = 0;
 
 	BOOL isTrue = config.mode->bpp != 16 || config.bpp32Hooked;
 	DWORD length = config.mode->width * config.mode->height * (isTrue ? sizeof(DWORD) : sizeof(WORD));
