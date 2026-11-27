@@ -1,42 +1,96 @@
-name: Build & Release DisciplesGL-Modern
+name: Build Upstream Release
 
 on:
-  push:
-    branches: [ "main", "master" ]
-    tags: [ "v*" ]
-  pull_request:
-    branches: [ "main", "master" ]
   workflow_dispatch:
     inputs:
-      create_release:
-        description: "Publish a GitHub Release"
-        required: false
-        default: false
-        type: boolean
+      release_tag:
+        description: "Upstream release tag to build (e.g. 'latest' or 'v2026.6')"
+        required: true
+        default: "latest"
+        type: string
+  schedule:
+    # Optional: check once a day at 06:00 UTC for a new upstream release
+    - cron: "0 6 * * *"
 
 permissions:
-  contents: write # Needed to create GitHub Releases
+  contents: write # Required to push tags and create Releases on your fork
 
 jobs:
-  build:
-    name: Build C4dll-R.dll (Win32 Release)
+  build-release:
+    name: Build Upstream Release (Win32)
     runs-on: windows-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout fork
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Query upstream release
+        id: upstream
+        shell: pwsh
+        run: |
+          $headers = @{
+            "Accept"        = "application/vnd.github+json"
+            "Authorization" = "Bearer ${{ secrets.GITHUB_TOKEN }}"
+          }
+
+          $inputTag = "${{ inputs.release_tag }}".Trim()
+          if ([string]::IsNullOrWhiteSpace($inputTag) -or $inputTag -eq "latest") {
+            $url = "https://api.github.com/repos/gitTerebi/DisciplesGL-Modern/releases/latest"
+          } else {
+            $url = "https://api.github.com/repos/gitTerebi/DisciplesGL-Modern/releases/tags/$inputTag"
+          }
+
+          $release = Invoke-RestMethod -Uri $url -Headers $headers
+          $tag = $release.tag_name
+          $title = if ([string]::IsNullOrWhiteSpace($release.name)) { $tag } else { $release.name }
+
+          Write-Host "Upstream release found: $tag ($title)"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "title=$title" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          # Save upstream release notes outside the git folder
+          $notes = "Compiled from upstream release ``$tag`` of gitTerebi/DisciplesGL-Modern.`n`n" + $release.body
+          $notes | Set-Content -Path "$env:RUNNER_TEMP\upstream_notes.md" -Encoding UTF8
+
+          # If triggered by schedule, skip if this release already exists on your fork
+          $forkUrl = "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag"
+          $exists = $false
+          try {
+            Invoke-RestMethod -Uri $forkUrl -Headers $headers | Out-Null
+            $exists = $true
+          } catch {
+            $exists = $false
+          }
+
+          if ("${{ github.event_name }}" -eq "schedule" -and $exists) {
+            Write-Host "Release $tag already exists on ${{ github.repository }}. Skipping scheduled build."
+            "should_build=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "should_build=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Fetch and checkout upstream release tag
+        if: steps.upstream.outputs.should_build == 'true'
+        shell: cmd
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          git fetch https://github.com/gitTerebi/DisciplesGL-Modern.git "refs/tags/%TAG%:refs/tags/%TAG%" --force
+          git checkout -f "%TAG%"
+          git submodule update --init --recursive
 
       - name: Set up MSBuild
+        if: steps.upstream.outputs.should_build == 'true'
         uses: microsoft/setup-msbuild@v2
 
       - name: Integrate vcpkg
+        if: steps.upstream.outputs.should_build == 'true'
         shell: cmd
         run: |
           vcpkg integrate install
 
       - name: Patch RC files if needed (afxres.h -> winres.h)
+        if: steps.upstream.outputs.should_build == 'true'
         shell: pwsh
         run: |
           Get-ChildItem -Path . -Filter "*.rc" -Recurse | ForEach-Object {
@@ -50,6 +104,7 @@ jobs:
           }
 
       - name: Build DisciplesGL
+        if: steps.upstream.outputs.should_build == 'true'
         shell: cmd
         run: |
           mkdir build_out
@@ -61,38 +116,47 @@ jobs:
             /m
 
       - name: Package Release Zip
+        if: steps.upstream.outputs.should_build == 'true'
         shell: pwsh
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
-          New-Item -ItemType Directory -Force -Path dist_package
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\dist_package"
 
-          # 1. Copy ready-to-use files from dist/ (shaders, Imgs, Mods, etc.)
           if (Test-Path "dist") {
-            Copy-Item -Path "dist\*" -Destination "dist_package" -Recurse -Force
+            Copy-Item -Path "dist\*" -Destination "$env:RUNNER_TEMP\dist_package" -Recurse -Force
           }
 
-          # 2. Verify C4dll-R.dll was compiled
           if (-not (Test-Path "build_out\C4dll-R.dll")) {
             Write-Error "C4dll-R.dll was not found in build_out\!"
             exit 1
           }
 
-          # 3. Copy C4dll-R.dll (and any runtime DLLs placed in OutDir by vcpkg)
-          Copy-Item -Path "build_out\*.dll" -Destination "dist_package\" -Force
+          Copy-Item -Path "build_out\*.dll" -Destination "$env:RUNNER_TEMP\dist_package\" -Force
 
-          # 4. Compress into a single ready-to-install zip
-          Compress-Archive -Path "dist_package\*" -DestinationPath "DisciplesGL-Modern-Win32.zip" -Force
+          $zipPath = "$env:RUNNER_TEMP\DisciplesGL-Modern-$env:TAG-Win32.zip"
+          Compress-Archive -Path "$env:RUNNER_TEMP\dist_package\*" -DestinationPath $zipPath -Force
 
       - name: Upload Build Artifact
+        if: steps.upstream.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: DisciplesGL-Modern-Win32
-          path: DisciplesGL-Modern-Win32.zip
+          name: DisciplesGL-Modern-${{ steps.upstream.outputs.tag }}-Win32
+          path: ${{ runner.temp }}/DisciplesGL-Modern-${{ steps.upstream.outputs.tag }}-Win32.zip
+
+      - name: Push tag and publish Release on fork
+        if: steps.upstream.outputs.should_build == 'true'
+        shell: cmd
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          git push origin "refs/tags/%TAG%"
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') || inputs.create_release == true
+        if: steps.upstream.outputs.should_build == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.run_number) }}
-          name: DisciplesGL-Modern (${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.run_number) }})
-          files: DisciplesGL-Modern-Win32.zip
-          generate_release_notes: true
+          tag_name: ${{ steps.upstream.outputs.tag }}
+          name: ${{ steps.upstream.outputs.title }}
+          body_path: ${{ runner.temp }}/upstream_notes.md
+          files: ${{ runner.temp }}/DisciplesGL-Modern-${{ steps.upstream.outputs.tag }}-Win32.zip
